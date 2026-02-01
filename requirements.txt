@@ -1,0 +1,19 @@
+# Web Framework
+fastapi
+uvicorn
+python-multipart
+
+# Video Processing
+yt-dlp             
+
+# Utilities
+requests
+python-dotenv
+
+# AI & Transkripsi
+faster-whisper>=0.10.0
+ctranslate2>=4.0.0
+
+deepfilternet
+pydub 
+soundfile
