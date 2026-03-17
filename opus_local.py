@@ -12,7 +12,11 @@ from google import genai
 from google.genai import types
 from faster_whisper import WhisperModel
 from openai import OpenAI
+from dotenv import load_dotenv
 import time
+
+# Load .env
+load_dotenv()
 
 # --- CONFIG STORAGE AMAN ---
 AI_DRIVE = r"D:\AI_Data"
@@ -20,7 +24,7 @@ os.environ["HF_HOME"] = os.path.join(AI_DRIVE, "huggingface")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # OPEN ROUTER CRED
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY');
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
