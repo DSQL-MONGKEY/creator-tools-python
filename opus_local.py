@@ -1,0 +1,366 @@
+import os
+import subprocess
+import sys
+import torch
+import gc
+import json
+import cv2
+import numpy as np
+from collections import deque
+from ultralytics import YOLO
+from google import genai
+from google.genai import types
+from faster_whisper import WhisperModel
+from openai import OpenAI
+import time
+
+# --- CONFIG STORAGE AMAN ---
+AI_DRIVE = r"D:\AI_Data"
+os.environ["HF_HOME"] = os.path.join(AI_DRIVE, "huggingface")
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# OPEN ROUTER CRED
+OPENROUTER_API_KEY = "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"
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+def cleanup_memory():
+   gc.collect()
+   if torch.cuda.is_available():
+      torch.cuda.empty_cache()
+
+def download_video(url, output_dir):
+   print(f"\n[DOWNLOADER] Mengambil video dari: {url}")
+   command = [
+      sys.executable, "-m", "yt_dlp", 
+      "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+      "-o", os.path.join(output_dir, "%(title)s.%(ext)s"),
+      url
+   ]
+   try:
+      subprocess.run(command, check=True)
+      print("[DOWNLOADER] ✅ Selesai!")
+      files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith('.mp4')]
+      latest_file = max(files, key=os.path.getctime)
+      return latest_file
+   except Exception as e:
+      print(f"[ERROR] Gagal download: {e}")
+      return None
+
+# --- HELPER 1: PEMBUAT ANIMASI KARAOKE (.ASS) ---
+def create_karaoke_ass(words_data, clip_start, output_path):
+   def format_ass_time(seconds):
+      seconds = max(0, seconds)
+      hours = int(seconds // 3600)
+      minutes = int((seconds % 3600) // 60)
+      secs = int(seconds % 60)
+      cs = int(round((seconds - int(seconds)) * 100))
+      return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+   ass_content = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: KaraokeStyle,Inter,90,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,0,2,10,10,400,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+   lines = []
+   current_line = []
+   for w in words_data:
+      current_line.append(w)
+      if len(current_line) >= 5 or w == words_data[-1]:
+            lines.append(current_line)
+            current_line = []
+
+   for line in lines:
+      line_start = line[0]['start'] - clip_start
+      line_end = line[-1]['end'] - clip_start
+      if line_end <= 0: continue
+            
+      karaoke_text = ""
+      for w in line:
+            duration_cs = int(round((w['end'] - w['start']) * 100))
+            karaoke_text += f"{{\\k{duration_cs}}}{w['word'].strip()} "
+
+      start_str = format_ass_time(line_start)
+      end_str = format_ass_time(line_end)
+      ass_content += f"Dialogue: 0,{start_str},{end_str},KaraokeStyle,,0,0,0,,{karaoke_text.strip()}\n"
+
+   with open(output_path, "w", encoding="utf-8") as f:
+      f.write(ass_content)
+
+# --- HELPER 2: AI CAMERA DIRECTOR (YOLO + MOTION) ---
+def process_ai_director_vision(raw_clip_path, temp_vision_path):
+   model = YOLO("yolov8n.pt") 
+   cap = cv2.VideoCapture(raw_clip_path)
+   fps = cap.get(cv2.CAP_PROP_FPS)
+   orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+   orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+   crop_w = int(orig_h * (9 / 16))
+   crop_h = orig_h
+
+   fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+   out = cv2.VideoWriter(temp_vision_path, fourcc, fps, (crop_w, crop_h))
+
+   total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+   frame_count = 0
+
+   current_camera_x = orig_w / 2
+   frames_since_cut = 0
+   MIN_SHOT_FRAMES = int(fps * 2.0)
+   
+   prev_gray = None
+   motion_history = {}
+   active_speaker_id = None
+
+   while cap.isOpened():
+      ret, frame = cap.read()
+      if not ret or frame is None or frame.size == 0: break
+
+      frame_count += 1
+      frames_since_cut += 1
+      gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+      gray = cv2.GaussianBlur(gray, (15, 15), 0)
+
+      results = model.track(frame, persist=True, classes=[0], verbose=False)
+
+      if prev_gray is not None and results[0].boxes is not None and results[0].boxes.id is not None:
+            frame_diff = cv2.absdiff(prev_gray, gray)
+            _, thresh = cv2.threshold(frame_diff, 20, 255, cv2.THRESH_BINARY)
+            
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            track_ids = results[0].boxes.id.int().cpu().tolist()
+            centers_x = results[0].boxes.xywh[:, 0].cpu().numpy()
+            
+            current_scores = {}
+            for box, track_id, cx in zip(boxes, track_ids, centers_x):
+               x1_b, y1_b, x2_b, y2_b = map(int, box)
+               x1_b, y1_b = max(0, x1_b), max(0, y1_b)
+               x2_b, y2_b = min(orig_w, x2_b), min(orig_h, y2_b)
+
+               y_mid = y1_b + int((y2_b - y1_b) * 0.5)
+               roi = thresh[y1_b:y_mid, x1_b:x2_b]
+               score = np.mean(roi) / 255.0 if roi.size > 0 else 0
+
+               if track_id not in motion_history:
+                  motion_history[track_id] = deque(maxlen=15)
+               motion_history[track_id].append(score)
+
+               avg_score = sum(motion_history[track_id]) / len(motion_history[track_id])
+               current_scores[track_id] = {'score': avg_score, 'cx': cx}
+
+            if current_scores:
+               best_id = max(current_scores, key=lambda k: current_scores[k]['score'])
+               if active_speaker_id is None:
+                  active_speaker_id = best_id
+                  current_camera_x = current_scores[best_id]['cx']
+               elif best_id != active_speaker_id:
+                  # SABUK PENGAMAN: Cek apakah speaker lama masih terlihat di kamera
+                  # Jika hilang (KeyError), anggap skor geraknya 0 agar mudah digantikan
+                  active_score = current_scores[active_speaker_id]['score'] if active_speaker_id in current_scores else 0
+                  
+                  if current_scores[best_id]['score'] > active_score + 0.01:
+                     if frames_since_cut > MIN_SHOT_FRAMES:
+                           active_speaker_id = best_id
+                           current_camera_x = current_scores[best_id]['cx']
+                           frames_since_cut = 0
+
+      prev_gray = gray
+      x1 = int(current_camera_x - (crop_w / 2))
+      
+      if x1 < 0: x1 = 0
+      elif x1 + crop_w > orig_w: x1 = orig_w - crop_w
+      x2 = x1 + crop_w
+
+      cropped_frame = frame[0:orig_h, x1:x2]
+      cropped_frame = np.ascontiguousarray(cropped_frame)
+      if cropped_frame.shape[0] != crop_h or cropped_frame.shape[1] != crop_w:
+            cropped_frame = cv2.resize(cropped_frame, (crop_w, crop_h))
+
+      try: out.write(cropped_frame)
+      except Exception: break
+
+      if frame_count % 15 == 0 and total_frames > 0:
+         percent = (frame_count / total_frames) * 100
+         print(f"\r      -> 🎬 AI Director Merender: {percent:.1f}% berjalan...", end="", flush=True)
+
+   cap.release()
+   out.release()
+
+def ask_openrouter_for_clips(transcript_text, num_clips):
+   print(f"\n[AI BRAIN] Membaca dan menganalisis transkrip untuk mencari {num_clips} momen viral...")
+   prompt = f"""
+   Anda adalah produser konten TikTok dan Reels yang jenius. Tugas Anda adalah mencari {num_clips} bagian paling viral, menarik, lucu, atau penuh insight dari transkrip video berikut.
+   Setiap klip harus berdurasi antara 30 hingga 60 detik (hitung dari selisih start dan end).
+   
+   Berikut adalah transkrip video:
+   {transcript_text}
+   
+   TUGAS:
+   Pilih {num_clips} momen terbaik. 
+   Balas HANYA dengan format array JSON persis seperti di bawah ini, tanpa awalan markdown (```json) dan tanpa teks penjelasan apapun. Harus valid JSON.
+   [
+      {{
+      "start": 10.5,
+      "end": 45.2,
+      "title": "Judul Menarik Singkat",
+      "reason": "Alasan singkat kenapa ini viral"
+      }}
+   ]
+   """
+   max_retries = 3
+   retry_delay = 10 # Waktu tunggu awal (detik)
+
+   for attempt in range(max_retries):
+      try:
+         response = client.models.generate_content(
+            model="gemini-1.5-pro", # Tetap gunakan 1.5-pro untuk konteks panjang
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+         )
+         result_text = response.text.strip()
+         
+         # Pembersihan Format
+         if result_text.startswith("```json"): result_text = result_text[7:-3].strip()
+         elif result_text.startswith("```"): result_text = result_text[3:-3].strip()
+         
+         return json.loads(result_text)
+            
+      except Exception as e:
+         error_msg = str(e)
+         print(f"[ERROR GEMINI] Percobaan {attempt + 1}/{max_retries} Gagal: {error_msg}")
+         
+         if attempt < max_retries - 1:
+            print(f"   -> Server sibuk. Menunggu {retry_delay} detik sebelum mencoba lagi...")
+            time.sleep(retry_delay)
+            retry_delay *= 2 # Exponential backoff: 10s, lalu 20s, dst.
+         else:
+            print("[FATAL] Gagal mendapatkan analisis setelah maksimal percobaan. Silakan coba lagi nanti atau ganti API Key.")
+            return []
+
+def analyze_and_clip(video_path, output_dir, num_clips=3):
+   print("\n[AI BRAIN] Membaca video (Transkripsi via Whisper)...")
+   cleanup_memory()
+   
+   model = WhisperModel("large-v3", device="cuda", compute_type="int8_float16", download_root=r"D:\AI_Data\huggingface")
+   segments, info = model.transcribe(video_path, language="id", word_timestamps=True)
+   total_duration = info.duration
+   
+   print(f"   🎥 Terdeteksi audio berdurasi: {total_duration / 60:.2f} menit. Memulai transkripsi...")
+   
+   transcript_text = ""
+   all_words = [] 
+   
+   for segment in segments:
+      transcript_text += f"[{segment.start:.1f} - {segment.end:.1f}] {segment.text.strip()}\n"
+      for word in segment.words:
+            all_words.append({'start': word.start, 'end': word.end, 'word': word.word})
+            
+      percent = (segment.end / total_duration) * 100
+      print(f"\r   ⏳ Menerjemahkan: {segment.end:.1f}s / {total_duration:.1f}s ({percent:.1f}%) berjalan...", end="", flush=True)
+      
+   print("\n   ✅ Transkripsi Selesai!")
+   cleanup_memory() 
+   
+   if not transcript_text.strip():
+      print("[ERROR] Tidak ada suara yang terdeteksi.")
+      return
+
+   print(f"   📄 Mengirim {len(transcript_text.split())} kata ke Gemini API...")
+   top_clips = ask_gemini_for_clips(transcript_text, num_clips)
+   
+   if not top_clips:
+      print("[ERROR] Gagal mendapatkan rekomendasi klip dari Gemini.")
+      return
+
+   print(f"\n[EDITING] Mulai memotong & merender Auto-Cut Director + efek teks Karaoke...")
+   base_name = os.path.splitext(os.path.basename(video_path))[0]
+   video_specific_dir = os.path.join(output_dir, base_name)
+   os.makedirs(video_specific_dir, exist_ok=True)
+   
+   for i, clip in enumerate(top_clips, 1):
+      start_t = float(clip["start"])
+      end_t = float(clip["end"])
+      duration = end_t - start_t
+      title = clip["title"].replace(" ", "_").replace("/", "")
+      
+      # Penamaan File Temporer dan Final
+      raw_clip_path = os.path.join(video_specific_dir, f"temp_raw_{i}.mp4")
+      vision_clip_path = os.path.join(video_specific_dir, f"temp_vision_{i}.mp4")
+      ass_path = os.path.join(video_specific_dir, f"karaoke_{i}.ass")
+      out_file = os.path.join(video_specific_dir, f"{i}_{title}.mp4")
+      
+      print(f"\n   -> Memproses Part {i}: {clip['title']} (Durasi: {duration:.1f}s)")
+      
+      # TAHAP 1: Ekstrak Klip Mentah (Super Cepat)
+      print("      1. Mengambil potongan video asli...")
+      cmd_extract = [
+            "ffmpeg", "-y", "-ss", str(start_t), "-t", str(duration),
+            "-i", video_path, "-c", "copy", raw_clip_path
+      ]
+      subprocess.run(cmd_extract, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+      
+      # TAHAP 2: AI Director (YOLO Motion Tracking)
+      print("      2. AI Director memotong adegan (Cut-to-Cut)...")
+      process_ai_director_vision(raw_clip_path, vision_clip_path)
+      
+      # TAHAP 3: Generate Subtitle
+      print("      3. Meracik animasi teks Karaoke...")
+      clip_words = [w for w in all_words if w['start'] >= start_t - 0.5 and w['end'] <= end_t + 0.5]
+      create_karaoke_ass(clip_words, start_t, ass_path)
+      
+      # TAHAP 4: Final Muxing (Gabung Visual, Audio, & Subtitle)
+      print("      4. Final Rendering (Menyatukan Visual & High-Res Audio)...")
+      sanitized_ass_path = ass_path.replace("\\", "/").replace(":", "\\:")
+      
+      cmd_final = [
+            "ffmpeg", "-y",
+            "-i", vision_clip_path,  # Input Video hasil Director
+            "-i", raw_clip_path,     # Input Audio dari video mentah
+            "-vf", f"ass='{sanitized_ass_path}'",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
+            "-map", "0:v:0", "-map", "1:a:0",
+            out_file
+      ]
+      subprocess.run(cmd_final, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+      
+      # TAHAP 5: Bersihkan File Sampah
+      for temp_file in [raw_clip_path, vision_clip_path, ass_path]:
+            if os.path.exists(temp_file):
+               os.remove(temp_file)
+
+   print(f"\n[SELESAI] Semua video viral berhasil dirender di folder: {base_name}/")
+
+if __name__ == "__main__":
+   print("=== THE OPUSCLIP KILLER (Ultimate AI Director Edition) ===")
+   
+   BASE_DIR = r"D:\applications\python-tools\media"
+   WORK_DIR = os.path.join(BASE_DIR, "viral_clips")
+   os.makedirs(WORK_DIR, exist_ok=True)
+   
+   mode = input("Pilih Mode:\n1. Download URL lalu Potong\n2. Potong Video Lokal yang sudah ada\n3. Download Video Saja\nPilihan (1/2/3): ")
+   
+   if mode == "1":
+      url = input("Masukkan URL YouTube/Instagram: ")
+      num_clips = int(input("Mau dipotong jadi berapa video viral? (misal: 3): "))
+      video_path = download_video(url, WORK_DIR)
+      if video_path: analyze_and_clip(video_path, WORK_DIR, num_clips=num_clips)
+            
+   elif mode == "2":
+      video_path = input("Masukkan FULL PATH video Anda: ").strip('"\'') 
+      if os.path.isfile(video_path):
+            num_clips = int(input("Mau dipotong jadi berapa video viral? (misal: 3): "))
+            analyze_and_clip(video_path, WORK_DIR, num_clips=num_clips)
+      else: print("[ERROR] File tidak ditemukan!")
+            
+   elif mode == "3":
+      url = input("Masukkan URL YouTube/Instagram: ")
+      video_path = download_video(url, WORK_DIR)
+      if video_path: print(f"\n[SELESAI] File: {video_path}")
