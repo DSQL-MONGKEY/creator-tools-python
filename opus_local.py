@@ -232,17 +232,6 @@ def process_ai_director_vision(raw_clip_path, temp_vision_path):
    out.release()
 
 
-def split_transcript_into_chunks(transcript_text, max_words=2500):
-   words = transcript_text.split()
-   chunks = []
-
-   for i in range(0, len(words), max_words):
-      chunk_words = words[i:i + max_words]
-      chunks.append(" ".join(chunk_words))
-
-   print(f"[CHUNKING] Total {len(chunks)} bagian dibuat.")
-   return chunks
-
 
 def clean_json_response(text):
    """Cleans model response by removing markdown/code fences and stray text so json.loads can parse it."""
@@ -269,34 +258,14 @@ def clean_json_response(text):
 
    return t.strip()
 
-
-def get_best_clips_from_chunks(transcript_text, num_clips):
-   chunks = split_transcript_into_chunks(transcript_text)
-
-   all_candidates = []
-
-   for i, chunk in enumerate(chunks, 1):
-      print(f"\n[AI] Memproses chunk {i}/{len(chunks)}")
-
-      clips = ask_openrouter_for_clips(
-         chunk,
-         num_clips=3,  # tiap chunk ambil 3 kandidat
-         chunk_index=i
-      )
-
-      if clips:
-         all_candidates.extend(clips)
-
-   if not all_candidates:
-      return []
-
-   print(f"\n[AI] Total kandidat: {len(all_candidates)}")
-
-   # 🔥 Ranking global (pakai AI lagi)
-   return rank_global_clips(all_candidates, num_clips)
+def build_transcript_from_json(data):
+   return "\n".join(
+      f"[{seg['start']:.1f} - {seg['end']:.1f}] {seg['text']}"
+      for seg in data["segments"]
+   )
 
 
-def ask_openrouter_for_clips(transcript_text, num_clips, chunk_index=1, max_retries=3):
+def ask_openrouter_for_clips(transcript_text, num_clips, max_retries=3):
    """
    Mengirim prompt ke OpenRouter (chat completions) dan mengembalikan array JSON
    sesuai format yang diharapkan:
@@ -342,8 +311,6 @@ def ask_openrouter_for_clips(transcript_text, num_clips, chunk_index=1, max_retr
    - Perubahan tone suara
    - Cerita personal atau pengalaman nyata
 
-   Ini adalah bagian ke-{chunk_index} dari video panjang.
-
    Berikut transkrip:
    {transcript_text}
 
@@ -374,13 +341,13 @@ def ask_openrouter_for_clips(transcript_text, num_clips, chunk_index=1, max_retr
          {"role": "user", "content": prompt}
       ],
       "temperature": 0.0,
-      "max_tokens": 1200
+      "max_tokens": 1500
    }
 
    retry_delay = 10
    for attempt in range(max_retries):
       try:
-         resp = requests.post(OPENROUTER_API_URL, headers=headers, json=body, timeout=120)
+         resp = requests.post(OPENROUTER_API_URL, headers=headers, json=body, timeout=180)
          if resp.status_code != 200:
             raise Exception(f"Status {resp.status_code}: {resp.text[:500]}")
 
@@ -431,90 +398,89 @@ def ask_openrouter_for_clips(transcript_text, num_clips, chunk_index=1, max_retr
             print("[FATAL] Gagal mendapatkan analisis setelah maksimal percobaan.")
             return []
 
+def analyze_and_clip(video_path, output_dir, num_clips=3, transcript_file=None):
 
-def rank_global_clips(clips, num_clips):
-   print("[AI] Melakukan ranking global...")
+   base_name = os.path.splitext(os.path.basename(video_path))[0]
+   video_specific_dir = os.path.join(output_dir, base_name)
+   os.makedirs(video_specific_dir, exist_ok=True)
 
-   prompt = f"""
-   Anda adalah editor viral TikTok.
+   # =============================================
+   # CHECK & LOAD EXISTING TRANSCRIPT
+   # =============================================
 
-   Dari daftar klip berikut, pilih {num_clips} terbaik secara global.
+   if transcript_file and os.path.exists(transcript_file):
+      print("[MODE] Menggunakan transcript dari file...")
 
-   Kriteria:
-   - paling menarik
-   - paling viral
-   - paling engaging
+      if transcript_file.endswith(".json"):
+         with open(transcript_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+         
+         transcript_text = build_transcript_from_json(data)
+         all_words = data.get("words, []")
+      else:
+         print("[ERROR] Format transcript tidak didukung...")
+         return
+   
+   else:
+      # =============================================
+      # WHISPER TRANSCRIPTION
+      # =============================================
+      
+      print("\n[AI BRAIN] Membaca video (Transkripsi via Mode Whisper Large-V3)...")
+      cleanup_memory()
 
-   Data:
-   {json.dumps(clips, ensure_ascii=False)}
+      model = WhisperModel("large-v3", device="cuda", compute_type="int8_float16", download_root=r"D:\AI_Data\huggingface")
+      segments, info = model.transcribe(video_path, language="id", word_timestamps=True)
+      segments = list(segments)
 
-   Balas HANYA JSON array:
-   """
+      total_duration = info.duration
 
-   headers = {
-      "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-      "Content-Type": "application/json"
-   }
+      print(f"[Whisper] 🎥 Terdeteksi audio berdurasi: {total_duration / 60:.2f} menit. Memulai transkripsi...")
 
-   body = {
-      "model": OPENROUTER_MODEL,
-      "messages": [
-         {"role": "system", "content": "Return ONLY raw JSON array. Do NOT use markdown, code fences, or any extra commentary."},
-         {"role": "user", "content": prompt}
-      ],
-      "temperature": 0.2
-   }
+      transcript_text = ""
+      all_words = []
 
-   resp = requests.post(OPENROUTER_API_URL, headers=headers, json=body)
+      for segment in segments:
+         transcript_text += f"[{segment.start:.1f} - {segment.end:.1f}] {segment.text.strip()}\n"
+         for word in segment.words:
+            all_words.append({'start': word.start, 'end': word.end, 'word': word.word})
 
-   try:
-      data = resp.json()
-      text = data["choices"][0]["message"]["content"]
-      cleaned = clean_json_response(text)
-      return json.loads(cleaned)
+         percent = (segment.end / total_duration) * 100
+         print(f"\r   ⏳ Menerjemahkan: {segment.end:.1f}s / {total_duration:.1f}s ({percent:.1f}%) berjalan...", end="", flush=True)
 
-   except Exception as e:
-      print("[ERROR RANKING]", e)
-      return clips[:num_clips]  # fallback
+      print("\n      ✅ Transkripsi Selesai!")
+      
+      json_path = os.path.join(video_specific_dir, base_name + ".json")
+      data = {
+         "duration": total_duration,
+         "segments": [
+            {
+               "start": segment.start,
+               "end": segment.end,
+               "text": segment.text.strip()
+            } for segment in segments
+         ],
+         "words": all_words
+      }
 
-
-def analyze_and_clip(video_path, output_dir, num_clips=3):
-   print("\n[AI BRAIN] Membaca video (Transkripsi via Whisper)...")
-   cleanup_memory()
-
-   model = WhisperModel("large-v3", device="cuda", compute_type="int8_float16", download_root=r"D:\AI_Data\huggingface")
-   segments, info = model.transcribe(video_path, language="id", word_timestamps=True)
-   total_duration = info.duration
-
-   print(f"   🎥 Terdeteksi audio berdurasi: {total_duration / 60:.2f} menit. Memulai transkripsi...")
-
-   transcript_text = ""
-   all_words = []
-
-   for segment in segments:
-      transcript_text += f"[{segment.start:.1f} - {segment.end:.1f}] {segment.text.strip()}\n"
-      for word in segment.words:
-         all_words.append({'start': word.start, 'end': word.end, 'word': word.word})
-
-      percent = (segment.end / total_duration) * 100
-      print(f"\r   ⏳ Menerjemahkan: {segment.end:.1f}s / {total_duration:.1f}s ({percent:.1f}%) berjalan...", end="", flush=True)
-
-   print("\n   ✅ Transkripsi Selesai!")
-   cleanup_memory()
+      with open(json_path, "w", encoding="utf-8") as f:
+         json.dump(data, f, ensure_ascii=False, indent=2)
+      print(f"    💾 Transcript JSON disimpan: {json_path}")
+      
+      cleanup_memory()
 
    if not transcript_text.strip():
       print("[ERROR] Tidak ada suara yang terdeteksi.")
       return
 
    print(f"   📄 Mengirim {len(transcript_text.split())} kata ke OpenRouter...")
-   top_clips = get_best_clips_from_chunks(transcript_text, num_clips)
+   top_clips = ask_openrouter_for_clips(transcript_text, num_clips)
 
    if not top_clips:
       print("[ERROR] Gagal mendapatkan rekomendasi klip dari OpenRouter.")
       return
 
    print(f"\n[EDITING] Mulai memotong & merender Auto-Cut Director + efek teks Karaoke...")
-   base_name = os.path.splitext(os.path.basename(video_path))[0]
    video_specific_dir = os.path.join(output_dir, base_name)
    os.makedirs(video_specific_dir, exist_ok=True)
 
@@ -586,22 +552,53 @@ if __name__ == "__main__":
    WORK_DIR = os.path.join(BASE_DIR, "viral_clips")
    os.makedirs(WORK_DIR, exist_ok=True)
    
-   mode = input("Pilih Mode:\n1. Download URL lalu Potong\n2. Potong Video Lokal yang sudah ada\n3. Download Video Saja\nPilihan (1/2/3): ")
+   mode = input(
+      "\nPilih Mode:\n"
+      "1. Download URL lalu Potong\n"
+      "2. Potong Video Lokal\n"
+      "3. Gunakan Video + File Transkrip\n"
+      "4. Download Video saja\n"
+      "Pilihan (1/2/3/4): "
+   ).strip()
    
    if mode == "1":
+      
       url = input("Masukkan URL YouTube/Instagram: ")
-      num_clips = int(input("Mau dipotong jadi berapa video viral? (misal: 3): "))
+      num_clips = int(input("Mau dipotong jadi berapa video? (misal: 3): "))
       video_path = download_video(url, WORK_DIR)
       if video_path: analyze_and_clip(video_path, WORK_DIR, num_clips=num_clips)
             
    elif mode == "2":
+      
       video_path = input("Masukkan FULL PATH video Anda: ").strip('"\'') 
       if os.path.isfile(video_path):
             num_clips = int(input("Mau dipotong jadi berapa video viral? (misal: 3): "))
             analyze_and_clip(video_path, WORK_DIR, num_clips=num_clips)
       else: print("[ERROR] File tidak ditemukan!")
-            
+   
    elif mode == "3":
+      
+      video_path = input("Masukkan FULL PATH video: ").strip('"\'')
+      transcript_path = input("Masukkan FULL PATH transcript (.json): ").strip('"\'')
+
+      if not os.path.isfile(video_path):
+         print("[ERROR] Video tidak ditemukan!")
+         exit()
+
+      if not os.path.isfile(transcript_path):
+         print("[ERROR] Transcript tidak ditemukan!")
+         exit()
+
+      num_clips = int(input("Jumlah clip: "))
+
+      analyze_and_clip(
+         video_path,
+         WORK_DIR,
+         num_clips=num_clips,
+         transcript_file=transcript_path
+      )
+   
+   elif mode == "4":
       url = input("Masukkan URL YouTube/Instagram: ")
       video_path = download_video(url, WORK_DIR)
       if video_path: print(f"\n[SELESAI] File: {video_path}")
